@@ -13,7 +13,11 @@ rm -rf * # remove pre-existing build files (if any)
 cmake ..
 make
 ```
-If everything compiles successfully, run your new binary:
+If everything compiles successfully, run the benchmark:
 ```sh
-./adaptive-router
+./adaptive_benchmark
+```
+To run the main entrypoint:
+```sh
+./adaptive_router
 ```
