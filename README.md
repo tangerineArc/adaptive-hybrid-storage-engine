@@ -7,8 +7,9 @@ sudo dnf install rocksdb-devel lmdb-devel cmake gcc g++
 ## How to compile and run?
 Navigate to your project's root directory in the terminal and execute the standard out-of-source CMake build process:
 ```sh
-mkdir build
+mkdir build # if the directory doesn't exist already
 cd build
+rm -rf * # remove pre-existing build files (if any)
 cmake ..
 make
 ```

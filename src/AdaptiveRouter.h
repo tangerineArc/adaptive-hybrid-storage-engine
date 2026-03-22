@@ -1,9 +1,12 @@
 #pragma once
 
+#include <atomic>
 #include <rocksdb/db.h>
 #include <rocksdb/options.h>
 #include <lmdb.h>
+#include <rocksdb/types.h>
 #include <string>
+#include <thread>
 #include <vector>
 #include <stdexcept>
 
@@ -15,6 +18,17 @@ private:
   // LMDB handles
   MDB_env* lmdb_env;
   MDB_dbi lmdb_dbi;
+
+  std::thread background_worker;
+  std::atomic<bool> keep_running;
+  rocksdb::SequenceNumber last_processed_seq;
+
+  // The private method that the thread will execute
+  void TailTransactionLog();
+
+  // Helpers to persist our position in the log
+  rocksdb::SequenceNumber LoadSequenceNumber();
+  void SaveSequenceNumber(MDB_txn* txn, rocksdb::SequenceNumber seq);
 
 public:
   AdaptiveRouter(const std::string& db_path);
