@@ -1,27 +1,36 @@
 #include "AdaptiveRouter.h"
+
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <filesystem>
 #include <lmdb.h>
+#include <map>
 #include <rocksdb/options.h>
 #include <rocksdb/slice.h>
 #include <rocksdb/status.h>
 #include <rocksdb/types.h>
 #include <rocksdb/write_batch.h>
+#include <shared_mutex>
+#include <string>
 
 // A reserved key that will never collide with normal user keys
-// (assuming your user keys don't start with double underscores)
+// (assuming your user keys don't start with double underscores).
 constexpr char SYSTEM_SEQ_KEY[] = "__SYSTEM_SEQ__";
 
+// The Background Worker Handler
 class LmdbIndexBuilder : public rocksdb::WriteBatch::Handler {
 private:
   MDB_txn* txn;
   MDB_dbi dbi;
+  std::map<std::string, std::optional<std::string>>& buffer;
+  std::shared_mutex& buffer_mutex;
 
 public:
-  LmdbIndexBuilder(MDB_txn* transaction, MDB_dbi database)
-    : txn(transaction), dbi(database) {}
+  LmdbIndexBuilder(MDB_txn* transaction, MDB_dbi database,
+                   std::map<std::string, std::optional<std::string>>& recent_writes,
+                   std::shared_mutex& mutex)
+    : txn(transaction), dbi(database), buffer(recent_writes), buffer_mutex(mutex) {}
 
   // Called when the log contains a PUT
   rocksdb::Status PutCF(uint32_t column_family_id, const rocksdb::Slice& key, const rocksdb::Slice& value) override {
@@ -35,6 +44,12 @@ public:
     mdb_val.mv_data = nullptr;
 
     mdb_put(txn, dbi, &mdb_key, &mdb_val, 0);
+
+    // Erase from the Read-Your-Writes Buffer
+    {
+      std::unique_lock<std::shared_mutex> lock(buffer_mutex);
+      buffer.erase(key.ToString());
+    }
     return rocksdb::Status::OK();
   }
 
@@ -45,6 +60,12 @@ public:
     mdb_key.mv_data = (void*)key.data();
 
     mdb_del(txn, dbi, &mdb_key, nullptr);
+
+    // Erase from the Read-Your-Writes Buffer
+    {
+      std::unique_lock<std::shared_mutex> lock(buffer_mutex);
+      buffer.erase(key.ToString());
+    }
     return rocksdb::Status::OK();
   }
 };
@@ -133,8 +154,15 @@ AdaptiveRouter::~AdaptiveRouter() {
   }
 }
 
+// The Write Path
 bool AdaptiveRouter::Put(const std::string& key, const std::string& value) {
   if (!rocks_db) return false;
+
+  // Add to the Read-Your-Writes buffer
+  {
+    std::unique_lock<std::shared_mutex> lock(buffer_mutex);
+    recent_writes_buffer[key] = value;
+  }
 
   rocksdb::WriteOptions write_options;
 
@@ -143,7 +171,6 @@ bool AdaptiveRouter::Put(const std::string& key, const std::string& value) {
   // you can force an fsync by uncommenting the next line, at the cost of write throughput.
   // write_options.sync = true;
 
-  // RocksDB natively accepts std::string via implicit conversion to rocksdb::Slice
   rocksdb::Status status = rocks_db->Put(write_options, key, value);
 
   if (!status.ok()) {
@@ -155,6 +182,12 @@ bool AdaptiveRouter::Put(const std::string& key, const std::string& value) {
 
 bool AdaptiveRouter::Delete(const std::string& key) {
   if (!rocks_db) return false;
+
+  // Write the Tombstone to the buffer
+  {
+    std::unique_lock<std::shared_mutex> lock(buffer_mutex);
+    recent_writes_buffer[key] = std::nullopt;
+  }
 
   rocksdb::WriteOptions write_options;
 
@@ -178,11 +211,16 @@ bool AdaptiveRouter::Get(const std::string& key, std::string& value) {
   return status.ok();
 }
 
+// The Smart Read Path
 std::vector<std::pair<std::string, std::string>> AdaptiveRouter::Scan(const std::string& start_key, const std::string& end_key) {
   std::vector<std::pair<std::string, std::string>> results;
   if (!lmdb_env || !rocks_db) return results;
 
-  // 1. Open a Read-Only LMDB Transaction
+  // ==========================================
+  //  Fetch from LMDB (The Disk Index)
+  // ==========================================
+
+  // Open a Read-Only LMDB Transaction
   MDB_txn* txn;
   mdb_txn_begin(lmdb_env, nullptr, MDB_RDONLY, &txn);
 
@@ -193,19 +231,16 @@ std::vector<std::pair<std::string, std::string>> AdaptiveRouter::Scan(const std:
   k.mv_size = start_key.size();
   k.mv_data = (void*)start_key.data();
 
-  // 2. Seek to the first key >= start_key
+  // Seek to the first key >= start_key
   int rc = mdb_cursor_get(cursor, &k, &v, MDB_SET_RANGE);
-
   std::vector<std::string> keys_to_fetch;
 
-  // 3. Iterate sequentially through the B+Tree
+  // Iterate sequentially through the B+Tree
   while (rc == MDB_SUCCESS) {
     std::string current_key((char*)k.mv_data, k.mv_size);
 
     // Stop if we have passed the end_key bound
-    if (current_key > end_key) {
-      break;
-    }
+    if (current_key > end_key) break;
 
     // CRITICAL: Filter out our internal metadata key!
     if (current_key != SYSTEM_SEQ_KEY) {
@@ -218,30 +253,78 @@ std::vector<std::pair<std::string, std::string>> AdaptiveRouter::Scan(const std:
 
   // Clean up LMDB resources
   mdb_cursor_close(cursor);
-  mdb_txn_abort(txn); // Abort is standard for closing Read-Only txns
+  mdb_txn_abort(txn);
 
-  if (keys_to_fetch.empty()) {
-    return results;
+  // ==========================================
+  //  Fetch Values from RocksDB
+  // ==========================================
+
+  std::vector<std::string> disk_values;
+  std::vector<rocksdb::Status> statuses;
+
+  // The Multi-Get Step
+  if (!keys_to_fetch.empty()) {
+    std::vector<rocksdb::Slice> slices_to_fetch;
+    slices_to_fetch.reserve(keys_to_fetch.size());
+    for (const auto& key_str : keys_to_fetch) {
+      slices_to_fetch.push_back(rocksdb::Slice(key_str));
+    }
+
+    rocksdb::ReadOptions read_options;
+    // MultiGet parallelizes the disk I/O and cache lookups inside RocksDB
+    statuses = rocks_db->MultiGet(read_options, slices_to_fetch, &disk_values);
   }
 
-  // 4. The Multi-Get Step
-  // Convert our std::strings to rocksdb::Slices
-  std::vector<rocksdb::Slice> slices_to_fetch;
-  slices_to_fetch.reserve(keys_to_fetch.size());
-  for (const auto& key_str : keys_to_fetch) {
-    slices_to_fetch.push_back(rocksdb::Slice(key_str));
-  }
+  // ==========================================
+  //  The Two-Pointer Merge (Disk + Buffer)
+  // ==========================================
 
-  std::vector<std::string> values;
-  rocksdb::ReadOptions read_options;
+  // Acquire a shared lock. Multiple Scans can read simultaneously.
+  // It only blocks if a Put is actively writing to the buffer.
+  std::shared_lock<std::shared_mutex> lock(buffer_mutex);
 
-  // MultiGet parallelizes the disk I/O and cache lookups inside RocksDB
-  std::vector<rocksdb::Status> statuses = rocks_db->MultiGet(read_options, slices_to_fetch, &values);
+  // Get an iterator to the start of our range in the memory buffer
+  auto buf_it = recent_writes_buffer.lower_bound(start_key);
 
-  // 5. Zip the keys and values together
-  for (size_t i = 0; i < keys_to_fetch.size(); ++i) {
-    if (statuses[i].ok()) {
-      results.push_back({keys_to_fetch[i], values[i]});
+  size_t disk_idx = 0;
+  while (disk_idx < keys_to_fetch.size() || (buf_it != recent_writes_buffer.end() && buf_it->first <= end_key)) {
+    // Check if the pointers are physically in bounds
+    bool disk_exists = disk_idx < keys_to_fetch.size();
+    bool buf_exists = (buf_it != recent_writes_buffer.end()) && (buf_it->first <= end_key);
+
+    if (disk_exists && buf_exists) {
+      if (keys_to_fetch[disk_idx] == buf_it->first) {
+        // Collision: Buffer is fresher, so it wins.
+        if (buf_it->second.has_value()) {
+          results.push_back({buf_it->first, buf_it->second.value()});
+        }
+        disk_idx++;
+        buf_it++;
+      } else if (keys_to_fetch[disk_idx] < buf_it->first) {
+        // Disk key is smaller, process it first to maintain sorted order
+        if (statuses[disk_idx].ok()) {
+          results.push_back({keys_to_fetch[disk_idx], disk_values[disk_idx]});
+        }
+        disk_idx++;
+      } else {
+        // Buffer key is smaller
+        if (buf_it->second.has_value()) {
+          results.push_back({buf_it->first, buf_it->second.value()});
+        }
+        buf_it++;
+      }
+    } else if (disk_exists) {
+      // Only disk keys remain
+      if (statuses[disk_idx].ok()) {
+        results.push_back({keys_to_fetch[disk_idx], disk_values[disk_idx]});
+      }
+      disk_idx++;
+    } else if (buf_exists) {
+      // Only buffer keys remain
+      if (buf_it->second.has_value()) {
+        results.push_back({buf_it->first, buf_it->second.value()});
+      }
+      buf_it++;
     }
   }
 
@@ -264,7 +347,7 @@ void AdaptiveRouter::TailTransactionLog() {
       mdb_txn_begin(lmdb_env, nullptr, 0, &txn);
 
       // 2. Feed the RocksDB batch into our custom LMDB Handler
-      LmdbIndexBuilder handler(txn, lmdb_dbi);
+      LmdbIndexBuilder handler(txn, lmdb_dbi, recent_writes_buffer, buffer_mutex);
       rocksdb::Status s = batch.writeBatchPtr->Iterate(&handler);
 
       if (s.ok()) {
