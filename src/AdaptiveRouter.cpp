@@ -1,6 +1,7 @@
 #include "AdaptiveRouter.h"
 #include <iostream>
 #include <filesystem>
+#include <rocksdb/options.h>
 
 AdaptiveRouter::AdaptiveRouter(const std::string& base_path) : rocks_db(nullptr), lmdb_env(nullptr) {
   std::string rocks_path = base_path + "/rocksdb_data";
@@ -11,7 +12,7 @@ AdaptiveRouter::AdaptiveRouter(const std::string& base_path) : rocks_db(nullptr)
   std::filesystem::create_directories(lmdb_path);
 
   // ==========================================
-  // 1. Initialize RocksDB
+  //  Initialize RocksDB
   // ==========================================
   rocksdb::Options rocks_options;
   rocks_options.create_if_missing = true;
@@ -23,7 +24,7 @@ AdaptiveRouter::AdaptiveRouter(const std::string& base_path) : rocks_db(nullptr)
   }
 
   // ==========================================
-  // 2. Initialize LMDB
+  //  Initialize LMDB
   // ==========================================
   if (mdb_env_create(&lmdb_env) != MDB_SUCCESS) {
     throw std::runtime_error("Failed to create LMDB environment");
@@ -68,10 +69,44 @@ AdaptiveRouter::~AdaptiveRouter() {
   }
 }
 
+bool AdaptiveRouter::Put(const std::string& key, const std::string& value) {
+  if (!rocks_db) return false;
+
+  rocksdb::WriteOptions write_options;
+
+  // By default, RocksDB writes to the MemTable and an OS-buffered Write-Ahead Log (WAL).
+  // If you need strict crash consistency (surviving a sudden power loss),
+  // you can force an fsync by uncommenting the next line, at the cost of write throughput.
+  // write_options.sync = true;
+
+  // RocksDB natively accepts std::string via implicit conversion to rocksdb::Slice
+  rocksdb::Status status = rocks_db->Put(write_options, key, value);
+
+  if (!status.ok()) {
+    std::cerr << "RocksDB Put failed: " << status.ToString() << std::endl;
+    return false;
+  }
+  return true;
+}
+
+bool AdaptiveRouter::Delete(const std::string& key) {
+  if (!rocks_db) return false;
+
+  rocksdb::WriteOptions write_options;
+
+  // Delete in an LSM-tree is actually a write operation (inserting a "tombstone").
+  // It undergoes the exact same MemTable/WAL process as a Put.
+  rocksdb::Status status = rocks_db->Delete(write_options, key);
+
+  if (!status.ok()) {
+    std::cerr << "RocksDB Delete failed: " << status.ToString() << std::endl;
+    return false;
+  }
+  return true;
+}
+
 // Stub methods for the API
-bool AdaptiveRouter::Put(const std::string& key, const std::string& value) { return false; }
 bool AdaptiveRouter::Get(const std::string& key, std::string& value) { return false; }
-bool AdaptiveRouter::Delete(const std::string& key) { return false; }
 std::vector<std::string> AdaptiveRouter::Scan(const std::string& start_key, const std::string& end_key) {
   return {};
 }
