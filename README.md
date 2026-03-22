@@ -10,7 +10,7 @@ Navigate to your project's root directory in the terminal and execute the standa
 mkdir build # if the directory doesn't exist already
 cd build
 rm -rf * # remove pre-existing build files (if any)
-cmake ..
+cmake -DCMAKE_BUILD_TYPE=Release .. # remove the flag to build in debug mode
 make
 ```
 If everything compiles successfully, run the benchmark:
