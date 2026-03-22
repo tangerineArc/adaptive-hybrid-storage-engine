@@ -7,6 +7,7 @@
 #include <rocksdb/types.h>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <stdexcept>
 
@@ -44,5 +45,5 @@ public:
   bool Delete(const std::string& key);
 
   // Scan returns a vector of keys for now (can be expanded to key-value pairs)
-  std::vector<std::string> Scan(const std::string& start_key, const std::string& end_key);
+  std::vector<std::pair<std::string, std::string>> Scan(const std::string& start_key, const std::string& end_key);
 };

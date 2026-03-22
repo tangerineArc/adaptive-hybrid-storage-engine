@@ -169,10 +169,83 @@ bool AdaptiveRouter::Delete(const std::string& key) {
   return true;
 }
 
-// Stub methods for the API
-bool AdaptiveRouter::Get(const std::string& key, std::string& value) { return false; }
-std::vector<std::string> AdaptiveRouter::Scan(const std::string& start_key, const std::string& end_key) {
-  return {};
+bool AdaptiveRouter::Get(const std::string& key, std::string& value) {
+  if (!rocks_db) return false;
+
+  rocksdb::ReadOptions read_options;
+  rocksdb::Status status = rocks_db->Get(read_options, key, &value);
+
+  return status.ok();
+}
+
+std::vector<std::pair<std::string, std::string>> AdaptiveRouter::Scan(const std::string& start_key, const std::string& end_key) {
+  std::vector<std::pair<std::string, std::string>> results;
+  if (!lmdb_env || !rocks_db) return results;
+
+  // 1. Open a Read-Only LMDB Transaction
+  MDB_txn* txn;
+  mdb_txn_begin(lmdb_env, nullptr, MDB_RDONLY, &txn);
+
+  MDB_cursor* cursor;
+  mdb_cursor_open(txn, lmdb_dbi, &cursor);
+
+  MDB_val k, v;
+  k.mv_size = start_key.size();
+  k.mv_data = (void*)start_key.data();
+
+  // 2. Seek to the first key >= start_key
+  int rc = mdb_cursor_get(cursor, &k, &v, MDB_SET_RANGE);
+
+  std::vector<std::string> keys_to_fetch;
+
+  // 3. Iterate sequentially through the B+Tree
+  while (rc == MDB_SUCCESS) {
+    std::string current_key((char*)k.mv_data, k.mv_size);
+
+    // Stop if we have passed the end_key bound
+    if (current_key > end_key) {
+      break;
+    }
+
+    // CRITICAL: Filter out our internal metadata key!
+    if (current_key != SYSTEM_SEQ_KEY) {
+      keys_to_fetch.push_back(current_key);
+    }
+
+    // Move to the next leaf node
+    rc = mdb_cursor_get(cursor, &k, &v, MDB_NEXT);
+  }
+
+  // Clean up LMDB resources
+  mdb_cursor_close(cursor);
+  mdb_txn_abort(txn); // Abort is standard for closing Read-Only txns
+
+  if (keys_to_fetch.empty()) {
+    return results;
+  }
+
+  // 4. The Multi-Get Step
+  // Convert our std::strings to rocksdb::Slices
+  std::vector<rocksdb::Slice> slices_to_fetch;
+  slices_to_fetch.reserve(keys_to_fetch.size());
+  for (const auto& key_str : keys_to_fetch) {
+    slices_to_fetch.push_back(rocksdb::Slice(key_str));
+  }
+
+  std::vector<std::string> values;
+  rocksdb::ReadOptions read_options;
+
+  // MultiGet parallelizes the disk I/O and cache lookups inside RocksDB
+  std::vector<rocksdb::Status> statuses = rocks_db->MultiGet(read_options, slices_to_fetch, &values);
+
+  // 5. Zip the keys and values together
+  for (size_t i = 0; i < keys_to_fetch.size(); ++i) {
+    if (statuses[i].ok()) {
+      results.push_back({keys_to_fetch[i], values[i]});
+    }
+  }
+
+  return results;
 }
 
 void AdaptiveRouter::TailTransactionLog() {
