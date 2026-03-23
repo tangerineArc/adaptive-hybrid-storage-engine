@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <lmdb.h>
 #include <map>
+#include <mutex>
 #include <rocksdb/options.h>
 #include <rocksdb/slice.h>
 #include <rocksdb/status.h>
