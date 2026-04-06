@@ -1,7 +1,7 @@
 ## How to install development dependencies?
 > The below installation instruction is for Fedora GNU/Linux distribution. For your particular OS, use a search engine or LLM to look up corresponding instructions.
 ```sh
-sudo dnf install rocksdb-devel lmdb-devel cmake gcc g++
+sudo dnf install rocksdb-devel lmdb-devel abseil-cpp-devel cmake gcc g++
 ```
 
 ## How to compile and run?
@@ -15,9 +15,5 @@ make
 ```
 If everything compiles successfully, run the benchmark:
 ```sh
-./adaptive_benchmark
-```
-To run the main entrypoint:
-```sh
-./adaptive_router
+./stress_test
 ```
