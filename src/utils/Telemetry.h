@@ -61,8 +61,8 @@ private:
   }
 
 public:
-  Telemetry() {
-    log_file.open("telemetry.csv");
+  Telemetry(const std::string& filename) {
+    log_file.open(filename);
     log_file << "Timestamp,Engine,OpType,AvgLatency_ms,P99Latency_ms,OpsPerSec,RamMB,Event\n";
     start_time = steady_clock::now();
 

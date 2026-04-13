@@ -3,8 +3,10 @@
 #include "Engine.h"
 #include "../utils/Telemetry.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -29,6 +31,9 @@ private:
   MDB_env* lmdb_env;
   MDB_dbi lmdb_dbi;
   Telemetry& tracker;
+
+  size_t expected_keys;
+  size_t payload_size;
 
   std::atomic<bool> running{true};
   std::atomic<bool> is_lmdb_ready{false};
@@ -77,9 +82,20 @@ private:
       v.mv_size = it->value().size();
       v.mv_data = (void*)it->value().data();
 
-      mdb_put(txn, lmdb_dbi, &k, &v, MDB_NOOVERWRITE);
+      int rc = mdb_put(txn, lmdb_dbi, &k, &v, MDB_NOOVERWRITE);
+      if (rc == MDB_MAP_FULL) {
+        std::cerr << "\n[HYBRID] 💀 FATAL: LMDB Map Full! Aborting migration.\n";
+        tracker.log_discrete_event("HYBRID", "MIGRATION_ABORT_MAP_FULL");
+
+        mdb_txn_abort(txn);
+        delete it;
+        rocks_db->ReleaseSnapshot(snapshot);
+        is_migrating = false;
+        return;
+      }
+
       count++;
-      if (count % 10000 == 0) {
+      if (count % 100'000 == 0) {
         mdb_txn_commit(txn);
         mdb_txn_begin(lmdb_env, NULL, 0, &txn);
       }
@@ -148,7 +164,7 @@ private:
   }
 
 public:
-  HybridEngine(Telemetry& t) : tracker(t) {
+  HybridEngine(Telemetry& t, size_t keys, size_t payload) : tracker(t), expected_keys(keys), payload_size(payload) {
     last_state_change = std::chrono::steady_clock::now();
 
     std::filesystem::remove_all("data_hybrid_rocks");
@@ -168,7 +184,11 @@ public:
     write_opts.disableWAL = false;
 
     mdb_env_create(&lmdb_env);
-    mdb_env_set_mapsize(lmdb_env, 1ULL * 1024 * 1024 * 1024);
+
+    size_t required_map_size = expected_keys * (8 + payload_size) * 2.5;
+    size_t final_map_size = std::max(required_map_size, static_cast<size_t>(1ULL * 1024 * 1024 * 1024));
+
+    mdb_env_set_mapsize(lmdb_env, final_map_size);
     mdb_env_open(lmdb_env, "./data_hybrid_lmdb", MDB_NOSYNC, 0664);
 
     MDB_txn* txn;
