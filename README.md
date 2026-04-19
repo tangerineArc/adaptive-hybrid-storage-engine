@@ -1,6 +1,6 @@
 # Adaptive Hybrid Storage Engine
 
-This project architects and implements an **Adaptive Dual-Indexing Hybrid Engine**, a routing layer that dynamically combines the write speeds of Log-Structured Merge (LSM) Trees (via RocksDB) and the read speeds of B+Trees (via LMDB). By continuously monitoring the workload through a stochastic model, the engine can adapt its underlying storage structures on the fly. 
+A high-performance hybrid storage engine that bridges the gap between read-optimized and write-optimized databases. By using a stochastic background model to monitor workloads in real-time, it automatically builds or drops a secondary LMDB index over RocksDB to guarantee optimal throughput and sub-millisecond scan latencies.
 
 ## Why?
 
